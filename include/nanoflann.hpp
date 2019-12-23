@@ -58,6 +58,8 @@
 #include <stdexcept>
 #include <vector>
 
+#include <mutex>
+
 /** Library version: 0xMmP (M=Major,m=minor,P=patch) */
 #define NANOFLANN_VERSION 0x132
 
@@ -610,6 +612,8 @@ class PooledAllocator {
   void *base;       /* Pointer to base of current block of storage. */
   void *loc;        /* Current location in block to next allocate memory. */
 
+  std::mutex mut;
+
   void internal_init() {
     remaining = 0;
     base = NULL;
@@ -647,6 +651,9 @@ public:
    * allocated from the pool.
    */
   void *malloc(const size_t req_size) {
+
+      std::lock_guard<std::mutex> locker(mut);
+
     /* Round size up to a multiple of wordsize.  The following expression
         only works for WORDSIZE that is a power of 2, by masking last bits of
         incremented size to zero.
@@ -846,6 +853,36 @@ public:
       if (val > max_elem)
         max_elem = val;
     }
+  }
+
+  // computeMinMaxApproximate
+  void computeMinMaxApproximate(const Derived &obj, IndexType *ind, IndexType count,
+      int element, ElementType &min_elem,
+      ElementType &max_elem) {
+      //min_elem = dataset_get(obj, ind[0], element);
+      if (count <= 200) {
+          min_elem = max_elem = dataset_get(obj, ind[0], element);
+          for (IndexType i = 1; i < count; ++i) {
+              ElementType val = dataset_get(obj, ind[i], element);
+              if (val < min_elem)
+                  min_elem = val;
+              if (val > max_elem)
+                  max_elem = val;
+          }
+      }
+      else {
+          min_elem = max_elem = dataset_get(obj, ind[0], element);
+
+          for (int x = 1; x <= 200; ++x)
+          {
+              IndexType i = ((count - 1) * x) / 200;
+              ElementType val = dataset_get(obj, ind[i], element);
+              if (val < min_elem)
+                  min_elem = val;
+              if (val > max_elem)
+                  max_elem = val;
+          }
+      }
   }
 
   /**
@@ -1184,6 +1221,157 @@ public:
     // Create a permutable array of indices to the input vectors.
     init_vind();
   }
+
+/////////////////////////////////////////////////////////////////////////////
+
+
+  void fastBuildIndex() {
+    BaseClassRef::m_size = dataset.kdtree_get_point_count();
+    BaseClassRef::m_size_at_index_build = BaseClassRef::m_size;
+    init_vind();
+    this->freeIndex(*this);
+    BaseClassRef::m_size_at_index_build = BaseClassRef::m_size;
+    if (BaseClassRef::m_size == 0)
+      return;
+    computeBoundingBox(BaseClassRef::root_bbox);
+    BaseClassRef::root_node =
+        this->fastDivideTree<0>(0, BaseClassRef::m_size,
+            BaseClassRef::root_bbox); // construct the tree
+  }
+
+  template <int cutfeat>
+  NodePtr fastDivideTree(const IndexType left, const IndexType right,
+      BoundingBox &bbox) {
+
+      static_assert(DIM > 0, "DIM must be static!");
+
+      auto &obj = *this;
+
+      NodePtr node = obj.pool.template allocate<Node>(); // allocate memory
+
+      /* If too few exemplars remain, then make this a leaf node. */
+      if ((right - left) <= static_cast<IndexType>(obj.m_leaf_max_size)) {
+          node->child1 = node->child2 = NULL; /* Mark as leaf node. */
+          node->node_type.lr.left = left;
+          node->node_type.lr.right = right;
+
+          // compute bounding-box of leaf points
+          for (int i = 0; i < (DIM > 0 ? DIM : obj.dim); ++i) {
+              const auto v = this->dataset_get(obj, obj.vind[left], i);
+              bbox[i].low = v;
+              bbox[i].high = v;
+          }
+          for (IndexType k = left + 1; k < right; ++k) {
+              for (int i = 0; i < (DIM > 0 ? DIM : obj.dim); ++i) {
+                  const auto v = this->dataset_get(obj, obj.vind[k], i);
+                  if (bbox[i].low > v)
+                      bbox[i].low = v;
+                  if (bbox[i].high < v)
+                      bbox[i].high = v;
+              }
+          }
+      }
+      else {
+          IndexType idx;
+          //int cutfeat;
+          DistanceType cutval;
+          fastMiddleSplit_<cutfeat>(&obj.vind[0] + left, right - left, idx, cutval,
+              bbox);
+
+          node->node_type.sub.divfeat = cutfeat;
+
+          const auto nextFeat = (cutfeat + 1) % (DIM > 0 ? DIM : obj.dim);
+
+          BoundingBox left_bbox(bbox);
+          left_bbox[cutfeat].high = cutval;
+
+          BoundingBox right_bbox(bbox);
+          right_bbox[cutfeat].low = cutval;
+
+          if (cutfeat < 6 && right - left > 10000)
+          {
+              auto f1 = std::async(std::launch::async, std::bind(&KDTreeSingleIndexAdaptor::fastDivideTree<nextFeat>, this, left, left + idx, left_bbox));
+              auto f2 = std::async(std::launch::async, std::bind(&KDTreeSingleIndexAdaptor::fastDivideTree<nextFeat>, this, left + idx, right, right_bbox));
+              node->child1 = f1.get();
+              node->child2 = f2.get();
+          }
+          else
+          {
+              node->child1 = fastDivideTree<nextFeat>(left, left + idx, left_bbox);
+              node->child2 = fastDivideTree<nextFeat>(left + idx, right, right_bbox);
+          }
+
+          node->node_type.sub.divlow = left_bbox[cutfeat].high;
+          node->node_type.sub.divhigh = right_bbox[cutfeat].low;
+
+          for (int i = 0; i < (DIM > 0 ? DIM : obj.dim); ++i) {
+              bbox[i].low = std::min(left_bbox[i].low, right_bbox[i].low);
+              bbox[i].high = std::max(left_bbox[i].high, right_bbox[i].high);
+          }
+      }
+
+      return node;
+  }
+
+  template <int cutfeat>
+  void fastMiddleSplit_(IndexType *ind, IndexType count,
+      IndexType &index, DistanceType &cutval,
+      const BoundingBox &bbox) {
+
+      auto &obj = *this;
+
+      //const DistanceType EPS = static_cast<DistanceType>(0.00001);
+      //ElementType max_span = bbox[0].high - bbox[0].low;
+      //for (int i = 1; i < (DIM > 0 ? DIM : obj.dim); ++i) {
+      //    ElementType span = bbox[i].high - bbox[i].low;
+      //    if (span > max_span) {
+      //        max_span = span;
+      //    }
+      //}
+      //ElementType max_spread = -1;
+      //cutfeat = 0;
+      //for (int i = 0; i < (DIM > 0 ? DIM : obj.dim); ++i) {
+      //    ElementType span = bbox[i].high - bbox[i].low;
+      //    if (span > (1 - EPS) * max_span) {
+      //        ElementType min_elem, max_elem;
+      //        this->computeMinMax(obj, ind, count, i, min_elem, max_elem);
+      //        ElementType spread = max_elem - min_elem;
+      //        ;
+      //        if (spread > max_spread) {
+      //            cutfeat = i;
+      //            max_spread = spread;
+      //        }
+      //    }
+      //}
+
+      // split in the middle
+      DistanceType split_val = (bbox[cutfeat].low + bbox[cutfeat].high) / 2;
+      ElementType min_elem, max_elem;
+      //this->computeMinMax(obj, ind, count, cutfeat, min_elem, max_elem);
+      this->computeMinMaxApproximate(obj, ind, count, cutfeat, min_elem, max_elem);
+
+      if (split_val < min_elem)
+          cutval = min_elem;
+      else if (split_val > max_elem)
+          cutval = max_elem;
+      else
+          cutval = split_val;
+
+      IndexType lim1, lim2;
+      this->planeSplit(obj, ind, count, cutfeat, cutval, lim1, lim2);
+
+      if (lim1 > count / 2)
+          index = lim1;
+      else if (lim2 < count / 2)
+          index = lim2;
+      else
+          index = count / 2;
+  }
+
+
+
+
+/////////////////////////////////////////////////////////////////////////////
 
   /**
    * Builds the index
